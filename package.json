@@ -1,0 +1,11 @@
+{
+  "name": "lodge-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "devDependencies": {
+    "supabase": "^2.117.0"
+  }
+}

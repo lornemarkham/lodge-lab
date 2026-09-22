@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lodge Lab</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --line:#ddd; --bg:#fafafa; --panel:#fff; --hot:#c8102e; --ok:#1b7f3b; --warm:#b26a00; --mono:ui-monospace,Menlo,Consolas,monospace; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; font:14px/1.45 system-ui,sans-serif; color:var(--fg); background:var(--bg); }
+  h1 { font-size:18px; margin:0 0 4px; }
+  h2 { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin:0 0 8px; }
+  header { display:flex; flex-wrap:wrap; gap:8px 24px; align-items:baseline; margin-bottom:12px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; }
+  section.wide { grid-column:1 / -1; }
+  table { border-collapse:collapse; width:100%; }
+  td, th { text-align:left; padding:3px 8px 3px 0; vertical-align:top; }
+  th { color:var(--muted); font-weight:500; white-space:nowrap; }
+  td.v { font-family:var(--mono); }
+  .src { color:var(--muted); font-size:12px; }
+  .muted { color:var(--muted); }
+  .bad { color:var(--hot); }
+  .ok { color:var(--ok); }
+  .warm { color:var(--warm); }
+  .hl { background:#fff3cd; }
+  #lifecycle { display:flex; gap:6px; flex-wrap:wrap; margin:6px 0 2px; }
+  #lifecycle span { padding:3px 10px; border:1px solid var(--line); border-radius:4px; font-family:var(--mono); font-size:12px; color:var(--muted); }
+  #lifecycle span.on { background:var(--fg); color:#fff; border-color:var(--fg); }
+  #errors { color:var(--hot); font-family:var(--mono); font-size:12px; white-space:pre-wrap; }
+  textarea { width:100%; min-height:70px; font:inherit; padding:6px; }
+  button { font:inherit; padding:6px 12px; cursor:pointer; }
+  button:disabled { cursor:default; opacity:.5; }
+  #output { font-family:var(--mono); font-size:13px; white-space:pre-wrap; background:#f4f4f4; border:1px solid var(--line); padding:8px; min-height:80px; max-height:320px; overflow:auto; margin:8px 0; }
+  #status { font-family:var(--mono); }
+  #status.active { color:var(--hot); font-weight:600; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:#bbb; margin-right:6px; vertical-align:middle; }
+  .dot.active { background:var(--hot); animation:blink .8s steps(2) infinite; }
+  @keyframes blink { 50% { opacity:.2; } }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:6px 0; }
+  select { font:inherit; padding:5px; }
+  .note { font-size:12px; color:var(--muted); margin-top:6px; }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:800px) { .two { grid-template-columns:1fr; } }
+  .run h3 { font-size:13px; font-family:var(--mono); margin:0 0 4px; }
+  .run .out { font-family:var(--mono); font-size:13px; white-space:pre-wrap; background:#f4f4f4; border:1px solid var(--line); padding:8px; min-height:80px; max-height:320px; overflow:auto; margin:4px 0; }
+  #cmp table { font-size:13px; }
+  #cmp th.col { font-family:var(--mono); color:var(--fg); }
+  #cmp td.kind { color:var(--muted); font-size:12px; white-space:nowrap; }
+  #cmp td.v { white-space:nowrap; }
+  #cmp tr.grp th { padding-top:10px; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; font-size:11px; }
+  kbd.k { font:11px var(--mono); padding:1px 5px; border:1px solid var(--line); border-radius:3px; background:#f4f4f4; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Lodge Lab</h1>
+    <div class="src">local learning instrument · 127.0.0.1 · no mocks</div>
+  </div>
+  <div class="src">Ollama: <span id="ollamaVersion" class="v">…</span></div>
+  <div class="src">last poll: <span id="pollTime">…</span> <span id="pollAge"></span></div>
+</header>
+
+<div id="lifecycle">
+  <span data-phase="STORED">STORED</span>
+  <span data-phase="LOADED">LOADED</span>
+  <span data-phase="INFERENCING">INFERENCING</span>
+  <span data-phase="TOKENS">TOKENS</span>
+  <span data-phase="UNLOADED">UNLOADED</span>
+</div>
+<div class="note" id="lifecycleNote"></div>
+<div id="errors"></div>
+
+<div class="grid">
+
+  <section>
+    <h2>Stored <span class="src">— Ollama /api/tags (on disk)</span></h2>
+    <div id="stored" class="muted">…</div>
+  </section>
+
+  <section>
+    <h2>Loaded <span class="src">— Ollama /api/ps (in memory)</span></h2>
+    <div id="loaded" class="muted">…</div>
+  </section>
+
+  <section>
+    <h2>GPU <span class="src">— nvidia-smi (driver view)</span></h2>
+    <div id="gpu" class="muted">…</div>
+  </section>
+
+  <section class="wide">
+    <h2>Inference <span class="src">— Ollama /api/generate via Lodge proxy, think:false, streaming</span></h2>
+    <div class="row">
+      <label>model <select id="model"></select></label>
+      <button id="generate">Generate</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="unload">Unload</button>
+      <span id="status"><span class="dot"></span>idle</span>
+    </div>
+    <textarea id="prompt">Explain, in detail and with examples, how a GPU executes a matrix multiply for a transformer layer. Then describe how KV-cache memory grows with context length. Be thorough.</textarea>
+    <div id="output"></div>
+    <div id="stats"></div>
+  </section>
+
+  <section class="wide">
+    <h2>Experiment <span class="src">— same prompt → model A, then model B, sequentially. Same proxy, think:false, default options.</span></h2>
+    <div class="row">
+      <label>A <select id="modelA"></select></label>
+      <label>B <select id="modelB"></select></label>
+      <label><input type="checkbox" id="cold" checked> unload everything before each run <span class="src">(measures a cold load; warm = whatever is already resident)</span></label>
+      <button id="runExp">Run comparison</button>
+      <button id="stopExp" disabled>Stop</button>
+      <span id="expStatus"><span class="dot"></span>idle</span>
+    </div>
+    <textarea id="expPrompt">You are helping a small team design a local-first note-taking app. Write a concise design memo covering: (1) the data model for notes, tags and links between notes; (2) how full-text search should work offline; (3) a conflict-resolution strategy for syncing between two devices that were both edited while offline. Give one concrete example for each section. Keep it under 500 words.</textarea>
+    <div class="two">
+      <div class="run" id="runA"><h3>A: —</h3><div class="out"></div><div class="src"></div></div>
+      <div class="run" id="runB"><h3>B: —</h3><div class="out"></div><div class="src"></div></div>
+    </div>
+    <div id="cmp"></div>
+    <div class="note">
+      <kbd class="k">Ollama</kbd> value reported by Ollama (/api/tags, /api/ps, or the final done:true line) ·
+      <kbd class="k">NVIDIA</kbd> value reported by nvidia-smi, sampled by the Lodge server every 500 ms during the stream ·
+      <kbd class="k">Lodge</kbd> wall-clock measured by this server or this browser ·
+      <kbd class="k">derived</kbd> arithmetic on the above.
+      No quality score is computed — read both responses and judge for yourself.
+    </div>
+  </section>
+
+</div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+
+// ------------------------------------------------------------ formatting
+const fmtGiB = (b) => b == null ? '—' : (b / 2 ** 30).toFixed(2) + ' GiB';
+const fmtMiB = (m) => m == null ? '—' : m.toLocaleString() + ' MiB';
+const nsToMs = (ns) => ns == null ? null : ns / 1e6;
+const fmtMs = (ms) => ms == null ? '—' : (ms >= 1000 ? (ms / 1000).toFixed(2) + ' s' : ms.toFixed(0) + ' ms');
+const fmtNum = (n) => n == null ? '—' : n.toLocaleString();
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+const rows = (pairs) => '<table>' + pairs.map(([k, v, src]) =>
+  `<tr><th>${esc(k)}</th><td class="v">${v}</td>${src ? `<td class="src">${esc(src)}</td>` : ''}</tr>`).join('') + '</table>';
+
+// ------------------------------------------------------------ state
+let lastState = null;
+let wasLoaded = false;        // observed a model in /api/ps earlier this session
+let sawUnload = false;        // observed loaded → not loaded transition
+let inference = { active:false, controller:null, firstContentAtClient:null, chunks:0, stopped:false };
+
+// ------------------------------------------------------------ polling
+async function poll() {
+  try {
+    const r = await fetch('/api/state', { cache:'no-store' });
+    lastState = await r.json();
+    render(lastState);
+  } catch (e) {
+    $('errors').textContent = 'Lodge server unreachable: ' + e.message;
+  }
+}
+setInterval(poll, 1000);
+setInterval(() => {
+  if (!lastState) return;
+  const age = (Date.now() - Date.parse(lastState.timestamp)) / 1000;
+  $('pollAge').textContent = `(${age.toFixed(1)}s ago)`;
+  $('pollAge').className = age > 3 ? 'bad' : '';
+}, 250);
+poll();
+
+function render(s) {
+  $('ollamaVersion').textContent = s.ollama.available ? s.ollama.version : 'UNAVAILABLE';
+  $('ollamaVersion').className = s.ollama.available ? 'ok' : 'bad';
+  $('pollTime').textContent = new Date(s.timestamp).toLocaleTimeString();
+  $('errors').textContent = s.errors.length ? s.errors.map(e => `✗ ${e.source}: ${e.message}`).join('\n') : '';
+
+  renderStored(s.ollama.stored);
+  renderLoaded(s.ollama.loaded);
+  renderGpu(s.gpu);
+  renderLifecycle(s);
+}
+
+function renderStored(models) {
+  const el = $('stored');
+  if (models === null) { el.innerHTML = '<span class="bad">source failed (see errors)</span>'; return; }
+  if (!models.length) { el.innerHTML = '<span class="muted">no models on disk</span>'; return; }
+  el.innerHTML = models.map(m => rows([
+    ['model', esc(m.name)],
+    ['disk size', `${fmtGiB(m.size)} <span class="src">(${fmtNum(m.size)} bytes)</span>`, 'tags.size'],
+    ['quantization', esc(m.details?.quantization_level ?? '—'), 'tags.details.quantization_level'],
+    ['params / family', `${esc(m.details?.parameter_size ?? '—')} / ${esc(m.details?.family ?? '—')}`, 'tags.details'],
+    ['native context', m.details?.context_length != null ? fmtNum(m.details.context_length) + ' tokens' : '<span class="muted">not reported by /api/tags</span>', 'tags.details.context_length (model file capability, NOT what Ollama will use)'],
+    ['format', esc(m.details?.format ?? '—')],
+  ])).join('<hr>');
+
+  // keep model selectors in sync
+  const names = models.map(m => m.name);
+  for (const [id, dflt] of [['model', 0], ['modelA', 0], ['modelB', 1]]) {
+    const sel = $(id);
+    if (sel.options.length !== names.length || [...sel.options].some((o, i) => o.value !== names[i])) {
+      const cur = sel.value;
+      sel.innerHTML = names.map(n => `<option>${esc(n)}</option>`).join('');
+      sel.value = names.includes(cur) ? cur : (names[dflt] ?? names[0] ?? '');
+    }
+  }
+}
+
+function renderLoaded(models) {
+  const el = $('loaded');
+  if (models === null) { el.innerHTML = '<span class="bad">source failed (see errors)</span>'; return; }
+  if (!models.length) { el.innerHTML = '<span class="muted">NOT LOADED — /api/ps reports no models in memory</span>'; return; }
+  el.innerHTML = models.map(m => {
+    const exp = m.expires_at ? Date.parse(m.expires_at) : null;
+    const left = exp ? (exp - Date.now()) / 1000 : null;
+    const onGpu = m.size_vram != null && m.size != null ? m.size_vram / m.size : null;
+    return rows([
+      ['model', `<span class="ok">LOADED</span> ${esc(m.name)}`],
+      ['VRAM (Ollama)', `${fmtGiB(m.size_vram)} <span class="src">(${fmtMiB(m.size_vram == null ? null : Math.round(m.size_vram / 2 ** 20))})</span>`, 'ps.size_vram — Ollama\'s own accounting of what it put on the GPU'],
+      ['total footprint (Ollama)', fmtGiB(m.size), 'ps.size — VRAM + RAM; ' + (onGpu == null ? '' : (onGpu * 100).toFixed(0) + '% on GPU')],
+      ['effective context', m.context_length != null ? fmtNum(m.context_length) + ' tokens' : '<span class="muted">not reported by /api/ps</span>', 'ps.context_length — what THIS load was configured with (num_ctx)'],
+      ['keep-alive expiry', exp ? `${new Date(exp).toLocaleTimeString()} <span class="src">(in ${left.toFixed(0)}s)</span>` : '—', 'ps.expires_at'],
+      ['quantization', esc(m.details?.quantization_level ?? '—'), 'ps.details'],
+    ]);
+  }).join('<hr>');
+}
+
+function renderGpu(gpu) {
+  const el = $('gpu');
+  if (gpu.devices === null) { el.innerHTML = '<span class="bad">nvidia-smi query failed (see errors)</span>'; return; }
+  let html = gpu.devices.map(d => rows([
+    ['device', `${esc(d.name)} <span class="src">driver ${esc(d.driver_version)}</span>`],
+    ['utilization', `<b>${d.utilization_gpu_pct ?? '—'} %</b> <span class="src">mem-ctrl ${d.utilization_memory_pct ?? '—'} %</span>`, 'utilization.gpu — % of last sample period a kernel was running'],
+    ['VRAM used (NVIDIA)', `<b>${fmtMiB(d.memory_used_mib)}</b>`, 'memory.used — ALL processes, incl. desktop'],
+    ['VRAM free / total', `${fmtMiB(d.memory_free_mib)} / ${fmtMiB(d.memory_total_mib)}`, 'memory.free / memory.total'],
+    ['temperature', `${d.temperature_c ?? '—'} °C`, 'temperature.gpu'],
+    ['power', `${d.power_draw_w ?? '—'} W / ${d.power_limit_w ?? '—'} W`, 'power.draw / power.limit'],
+  ])).join('<hr>');
+
+  html += '<h2 style="margin-top:10px">Compute processes <span class="src">— nvidia-smi --query-compute-apps</span></h2>';
+  if (gpu.processes === null) html += '<span class="bad">query failed (see errors)</span>';
+  else if (!gpu.processes.length) html += '<span class="muted">none</span>';
+  else html += '<table><tr><th>pid</th><th>process</th><th>used VRAM</th></tr>' + gpu.processes.map(p => {
+    const rel = /ollama|llama/i.test(p.process_name);
+    return `<tr class="${rel ? 'hl' : ''}"><td class="v">${p.pid ?? '—'}</td><td class="v">${esc(p.process_name)}${rel ? ' <span class="ok">◀ inference runner</span>' : ''}</td><td class="v">${fmtMiB(p.used_memory_mib)}</td></tr>`;
+  }).join('') + '</table>';
+  el.innerHTML = html;
+}
+
+function renderLifecycle(s) {
+  const loadedNow = Array.isArray(s.ollama.loaded) && s.ollama.loaded.length > 0;
+  if (loadedNow) { wasLoaded = true; sawUnload = false; }
+  else if (wasLoaded) { sawUnload = true; wasLoaded = false; }
+
+  let phase, note;
+  if (inference.active && inference.firstContentAtClient) { phase = 'TOKENS'; note = 'TOKENS: this browser is receiving response text on an open /api/generate stream (client-observed).'; }
+  else if (inference.active) { phase = 'INFERENCING'; note = 'INFERENCING: this browser has an open /api/generate request but no content yet (client-observed — covers model load + prompt eval).'; }
+  else if (loadedNow) { phase = 'LOADED'; note = 'LOADED: Ollama /api/ps reports a model in memory (measured). Nothing is being generated from this page.'; }
+  else if (sawUnload) { phase = 'UNLOADED'; note = 'UNLOADED: /api/ps went from non-empty to empty during this session (measured transition).'; }
+  else { phase = 'STORED'; note = 'STORED: model(s) on disk per /api/tags, nothing in /api/ps.'; }
+
+  document.querySelectorAll('#lifecycle span').forEach(el => el.classList.toggle('on', el.dataset.phase === phase));
+  $('lifecycleNote').textContent = note;
+}
+
+// ------------------------------------------------------------ inference
+function setStatus(text, active) {
+  $('status').innerHTML = `<span class="dot ${active ? 'active' : ''}"></span>${esc(text)}`;
+  $('status').className = active ? 'active' : '';
+  $('generate').disabled = active;
+  $('stop').disabled = !active;
+  $('unload').disabled = active;
+}
+
+// One streamed /api/generate call. Returns everything measured about it and
+// never throws; errors land in `.error`.
+async function streamGenerate(model, prompt, { signal, onText, onChunk }) {
+  const run = { model, prompt, started_at: new Date().toISOString(), ollama:null, lodge:null, clientTtfcMs:null, chunks:0, error:null };
+  const tClientStart = performance.now();
+  try {
+    const r = await fetch('/api/generate', {
+      method:'POST', headers:{ 'content-type':'application/json' },
+      body: JSON.stringify({ model, prompt }),
+      signal,
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream:true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const j = JSON.parse(line);
+        if (j.lodge) { run.lodge = j.lodge; if (j.error) run.error = j.error; continue; }
+        if (j.error) { run.error = j.error; continue; }
+        run.chunks++;
+        if (j.response) {
+          if (run.clientTtfcMs == null) run.clientTtfcMs = performance.now() - tClientStart;
+          onText?.(j.response);
+        }
+        onChunk?.(run);
+        if (j.done) run.ollama = j;
+      }
+    }
+  } catch (e) {
+    run.error = e.name === 'AbortError' ? 'stopped by user' : e.message;
+  }
+  run.clientTotalMs = performance.now() - tClientStart;
+  return run;
+}
+
+$('generate').onclick = async () => {
+  const model = $('model').value;
+  const prompt = $('prompt').value;
+  if (!model || !prompt.trim()) return;
+
+  inference = { active:true, controller:new AbortController(), firstContentAtClient:null, chunks:0, stopped:false };
+  $('output').textContent = '';
+  $('stats').innerHTML = '';
+  setStatus('generating… waiting for first content', true);
+
+  const run = await streamGenerate(model, prompt, {
+    signal: inference.controller.signal,
+    onText: (t) => { $('output').textContent += t; $('output').scrollTop = $('output').scrollHeight; },
+    onChunk: (r) => {
+      inference.chunks = r.chunks;
+      if (r.clientTtfcMs != null) { inference.firstContentAtClient = r.clientTtfcMs; setStatus(`streaming… ${r.chunks} chunks received (browser count)`, true); }
+    },
+  });
+  let streamError = run.error;
+  if (inference.stopped && !streamError) streamError = 'stopped by user';
+
+  inference.active = false;
+  setStatus(streamError ? `ended: ${streamError}` : 'done', false);
+  renderStats(run.ollama, run.lodge, run.clientTtfcMs, streamError);
+  poll();
+};
+
+$('stop').onclick = () => { inference.stopped = true; inference.controller?.abort(); };
+
+$('unload').onclick = async () => {
+  const model = $('model').value;
+  $('unload').disabled = true;
+  setStatus(`unloading ${model}…`, false);
+  try {
+    const r = await fetch('/api/unload', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ model }) });
+    const j = await r.json();
+    setStatus(r.ok ? `unload requested (Ollama done_reason=${j.ollama?.done_reason ?? '?'}, ${fmtMs(j.lodge?.unload_request_ms)})` : `unload failed: ${j.error ?? r.status}`, false);
+  } catch (e) {
+    setStatus('unload failed: ' + e.message, false);
+  }
+  $('unload').disabled = false;
+  poll();
+};
+
+function renderStats(o, lodge, clientTtfc, err) {
+  const list = [];
+  if (err) list.push(['stream ended with', `<span class="bad">${esc(err)}</span>`]);
+  if (o) {
+    const evalMs = nsToMs(o.eval_duration), promptMs = nsToMs(o.prompt_eval_duration);
+    const tps = o.eval_count != null && evalMs ? o.eval_count / (evalMs / 1000) : null;
+    const ptps = o.prompt_eval_count != null && promptMs ? o.prompt_eval_count / (promptMs / 1000) : null;
+    const ctxLen = lastState?.ollama?.loaded?.find(m => m.name === o.model)?.context_length ?? null;
+    const used = o.prompt_eval_count != null && o.eval_count != null ? o.prompt_eval_count + o.eval_count : null;
+    list.push(
+      ['load duration', fmtMs(nsToMs(o.load_duration)), 'Ollama load_duration (0-ish means already loaded)'],
+      ['time to first content (server)', fmtMs(lodge?.first_content_ms), 'Lodge server: upstream request → first NDJSON line with non-empty response'],
+      ['time to first content (browser)', fmtMs(clientTtfc), 'browser: fetch start → first response text rendered'],
+      ['prompt tokens', fmtNum(o.prompt_eval_count) + (o.prompt_eval_cached_count != null ? ` <span class="src">(+${fmtNum(o.prompt_eval_cached_count)} served from prefix cache)</span>` : ''), 'Ollama prompt_eval_count / prompt_eval_cached_count'],
+      ['prompt eval duration', fmtMs(promptMs) + (ptps ? ` <span class="src">(${ptps.toFixed(0)} tok/s)</span>` : ''), 'Ollama prompt_eval_duration'],
+      ['generated tokens', fmtNum(o.eval_count), 'Ollama eval_count'],
+      ['generation duration', fmtMs(evalMs), 'Ollama eval_duration'],
+      ['tokens / sec', tps ? tps.toFixed(1) : '—', 'derived: eval_count ÷ eval_duration'],
+      ['total duration', fmtMs(nsToMs(o.total_duration)), 'Ollama total_duration (load + prompt + generation)'],
+      ['context usage (this request)', used == null ? '—' : `${fmtNum(used)}${ctxLen ? ` / ${fmtNum(ctxLen)} (${(used / ctxLen * 100).toFixed(1)}%)` : ' / effective ctx unknown'}`, 'derived: prompt_eval_count + eval_count vs /api/ps context_length; not a KV-cache readout'],
+      ['done reason', esc(o.done_reason ?? '—'), 'Ollama done_reason'],
+      ['stream chunks', fmtNum(inference.chunks), 'browser count of NDJSON lines received from Ollama'],
+    );
+  } else if (!err) {
+    list.push(['final stats', '<span class="bad">no final (done:true) line received from Ollama</span>']);
+  }
+  if (lodge) list.push(['server: upstream headers / first chunk / end', `${fmtMs(lodge.upstream_headers_ms)} / ${fmtMs(lodge.first_chunk_ms)} / ${fmtMs(lodge.stream_end_ms)}`, 'Lodge server timings from upstream request start']);
+  $('stats').innerHTML = rows(list);
+}
+
+// ------------------------------------------------------------ experiment
+let experiment = { active:false, controller:null, stopped:false, runs:[] };
+
+function setExpStatus(text, active) {
+  $('expStatus').innerHTML = `<span class="dot ${active ? 'active' : ''}"></span>${esc(text)}`;
+  $('expStatus').className = active ? 'active' : '';
+  $('runExp').disabled = active;
+  $('stopExp').disabled = !active;
+  $('generate').disabled = active || inference.active;
+  $('unload').disabled = active || inference.active;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Ask Ollama to evict every resident model, then wait until /api/ps agrees.
+// Returns what was unloaded and how long the eviction took to become visible.
+async function unloadAll(signal) {
+  const rec = { requested:[], visible_empty_after_ms:null, timed_out:false };
+  const s0 = await (await fetch('/api/state', { cache:'no-store', signal })).json();
+  const loaded = (s0.ollama.loaded ?? []).map(m => m.name);
+  if (!loaded.length) return rec;
+  const t0 = performance.now();
+  for (const name of loaded) {
+    const r = await fetch('/api/unload', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ model:name }), signal });
+    rec.requested.push({ model:name, http:r.status });
+  }
+  while (performance.now() - t0 < 30000) {
+    const st = await (await fetch('/api/state', { cache:'no-store', signal })).json();
+    if (Array.isArray(st.ollama.loaded) && st.ollama.loaded.length === 0) { rec.visible_empty_after_ms = performance.now() - t0; break; }
+    await sleep(250);
+  }
+  if (rec.visible_empty_after_ms == null) rec.timed_out = true;
+  return rec;
+}
+
+$('runExp').onclick = async () => {
+  const models = [$('modelA').value, $('modelB').value];
+  const prompt = $('expPrompt').value;
+  if (!models[0] || !models[1] || !prompt.trim()) return;
+  const cold = $('cold').checked;
+
+  experiment = { active:true, controller:new AbortController(), stopped:false, runs:[], prompt, cold };
+  $('cmp').innerHTML = '';
+  for (const id of ['runA', 'runB']) {
+    const el = $(id);
+    el.querySelector('h3').textContent = `${id.slice(-1)}: ${models[id === 'runA' ? 0 : 1]}`;
+    el.querySelector('.out').textContent = '';
+    el.querySelector('.src').textContent = '';
+  }
+
+  try {
+    for (let i = 0; i < 2; i++) {
+      if (experiment.stopped) break;
+      const label = i === 0 ? 'A' : 'B';
+      const model = models[i];
+      const box = $(i === 0 ? 'runA' : 'runB');
+      let unload = null;
+      if (cold) {
+        setExpStatus(`${label}: unloading resident models…`, true);
+        unload = await unloadAll(experiment.controller.signal);
+        box.querySelector('.src').textContent = unload.requested.length
+          ? `cold: unloaded ${unload.requested.map(u => u.model).join(', ')} — /api/ps empty after ${fmtMs(unload.visible_empty_after_ms)}${unload.timed_out ? ' (TIMED OUT, ran anyway)' : ''}`
+          : 'cold: nothing was resident';
+      } else {
+        const st = lastState?.ollama?.loaded ?? [];
+        box.querySelector('.src').textContent = `warm: resident before run = ${st.length ? st.map(m => m.name).join(', ') : 'nothing'}`;
+      }
+      if (experiment.stopped) break;
+
+      // The lifecycle strip is client-observed; keep it honest during experiment runs too.
+      inference = { active:true, controller:experiment.controller, firstContentAtClient:null, chunks:0, stopped:false };
+      setExpStatus(`${label}: ${model} — waiting for first content…`, true);
+      const run = await streamGenerate(model, prompt, {
+        signal: experiment.controller.signal,
+        onText: (t) => { const o = box.querySelector('.out'); o.textContent += t; o.scrollTop = o.scrollHeight; },
+        onChunk: (r) => {
+          inference.chunks = r.chunks;
+          if (r.clientTtfcMs != null) { inference.firstContentAtClient = r.clientTtfcMs; setExpStatus(`${label}: ${model} — streaming, ${r.chunks} chunks`, true); }
+        },
+      });
+      inference.active = false;
+      run.label = label; run.cold = cold; run.unload = unload;
+      experiment.runs.push(run);
+      poll();
+      if (run.error) break;
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') { console.error(e); experiment.runs.push({ label:'?', model:'—', prompt, error:e.message, chunks:0 }); }
+  } finally {
+    experiment.active = false;
+    inference.active = false;
+    const err = experiment.runs.find(r => r.error)?.error;
+    setExpStatus(experiment.stopped ? 'stopped by user' : err ? `ended: ${err}` : `done — ${experiment.runs.length} runs`, false);
+    renderComparison(experiment.runs);
+    poll();
+  }
+};
+
+$('stopExp').onclick = () => { experiment.stopped = true; experiment.controller?.abort(); };
+
+// Rows: [label, kind, valueFn(run) → {n:number|null, text:string}, note]
+// kind is exactly one of: 'Ollama' | 'NVIDIA' | 'Lodge' | 'derived'
+function comparisonRows() {
+  const N = (n, text) => ({ n, text });
+  const ms = (x) => N(x, fmtMs(x));
+  const stored = (r) => lastState?.ollama?.stored?.find(m => m.name === r.model);
+  const psm = (r) => r.lodge?.after?.ps_model ?? null;
+  const o = (r) => r.ollama;
+  return [
+    ['group', 'Model'],
+    ['model', 'Ollama', r => N(null, esc(r.model)), '/api/tags name'],
+    ['quantization', 'Ollama', r => N(null, esc(stored(r)?.details?.quantization_level ?? psm(r)?.details?.quantization_level ?? '—')), 'tags.details.quantization_level'],
+    ['params', 'Ollama', r => N(null, esc(stored(r)?.details?.parameter_size ?? '—')), 'tags.details.parameter_size'],
+    ['size on disk', 'Ollama', r => N(stored(r)?.size ?? null, fmtGiB(stored(r)?.size)), 'tags.size'],
+    ['group', 'Memory (after the run, model still resident)'],
+    ['VRAM allocated (Ollama)', 'Ollama', r => N(psm(r)?.size_vram ?? null, psm(r) ? fmtGiB(psm(r).size_vram) : '<span class="muted">not in /api/ps</span>'), 'ps.size_vram — Ollama\'s own accounting'],
+    ['total footprint (Ollama)', 'Ollama', r => N(psm(r)?.size ?? null, psm(r) ? fmtGiB(psm(r).size) : '—'), 'ps.size — VRAM + RAM'],
+    ['effective context', 'Ollama', r => N(psm(r)?.context_length ?? null, psm(r)?.context_length != null ? fmtNum(psm(r).context_length) : '—'), 'ps.context_length (num_ctx for this load)'],
+    ['runner VRAM after run (NVIDIA)', 'NVIDIA', r => { const p = r.lodge?.after?.runner_processes; const v = p?.length ? p.reduce((a, x) => a + (x.used_memory_mib ?? 0), 0) : null; return N(v, p == null ? '—' : p.length ? fmtMiB(v) + (p.length > 1 ? ` <span class="src">(${p.length} procs)</span>` : '') : '<span class="muted">no runner process</span>'); }, 'compute-apps used_memory of ollama/llama-server processes, read right after the stream closed'],
+    ['runner VRAM, peak during stream (NVIDIA)', 'NVIDIA', r => N(r.lodge?.gpu?.runner_used_memory_mib_max ?? null, fmtMiB(r.lodge?.gpu?.runner_used_memory_mib_max)), 'max over samples of all ollama/llama-server processes — includes a previous model\'s runner if Ollama was still evicting it'],
+    ['device VRAM used, peak during stream (NVIDIA)', 'NVIDIA', r => N(r.lodge?.gpu?.memory_used_mib_max ?? null, fmtMiB(r.lodge?.gpu?.memory_used_mib_max)), 'max over samples of memory.used — whole device incl. desktop'],
+    ['group', 'Timing'],
+    ['cold / warm', 'Lodge', r => N(null, r.cold ? 'cold' : 'warm'), r => r.unload?.requested?.length ? `unloaded ${r.unload.requested.map(u => u.model).join(', ')} first` : (r.cold ? 'nothing was resident' : 'no unload performed')],
+    ['load duration', 'Ollama', r => ms(nsToMs(o(r)?.load_duration)), 'load_duration from the done:true line'],
+    ['time to first content (server)', 'Lodge', r => ms(r.lodge?.first_content_ms), 'upstream request → first NDJSON line with non-empty response'],
+    ['time to first content (browser)', 'Lodge', r => ms(r.clientTtfcMs), 'fetch() start → first response text'],
+    ['prompt tokens', 'Ollama', r => N(o(r)?.prompt_eval_count ?? null, fmtNum(o(r)?.prompt_eval_count) + (o(r)?.prompt_eval_cached_count ? ` <span class="src">(+${fmtNum(o(r).prompt_eval_cached_count)} cached)</span>` : '')), 'prompt_eval_count (prompt_eval_cached_count if any)'],
+    ['prompt eval duration', 'Ollama', r => ms(nsToMs(o(r)?.prompt_eval_duration)), 'prompt_eval_duration'],
+    ['prompt eval rate', 'derived', r => { const d = nsToMs(o(r)?.prompt_eval_duration), c = o(r)?.prompt_eval_count; const v = d && c != null ? c / (d / 1000) : null; return N(v, v == null ? '—' : v.toFixed(0) + ' tok/s'); }, 'prompt_eval_count ÷ prompt_eval_duration'],
+    ['generated tokens', 'Ollama', r => N(o(r)?.eval_count ?? null, fmtNum(o(r)?.eval_count)), 'eval_count'],
+    ['generation duration', 'Ollama', r => ms(nsToMs(o(r)?.eval_duration)), 'eval_duration'],
+    ['tokens / sec', 'derived', r => { const d = nsToMs(o(r)?.eval_duration), c = o(r)?.eval_count; const v = d && c != null ? c / (d / 1000) : null; return N(v, v == null ? '—' : v.toFixed(1)); }, 'eval_count ÷ eval_duration'],
+    ['total duration', 'Ollama', r => ms(nsToMs(o(r)?.total_duration)), 'total_duration (load + prompt + generation)'],
+    ['wall clock (browser)', 'Lodge', r => ms(r.clientTotalMs), 'fetch() start → stream closed'],
+    ['context usage (this request)', 'derived', r => { const u = o(r)?.prompt_eval_count != null && o(r)?.eval_count != null ? o(r).prompt_eval_count + o(r).eval_count : null; const c = psm(r)?.context_length; return N(u, u == null ? '—' : `${fmtNum(u)}${c ? ` / ${fmtNum(c)} (${(u / c * 100).toFixed(1)}%)` : ''}`); }, 'prompt_eval_count + eval_count vs ps.context_length'],
+    ['done reason', 'Ollama', r => N(null, esc(o(r)?.done_reason ?? '—')), 'done_reason'],
+    ['group', 'GPU during the stream (sampled)'],
+    ['samples', 'Lodge', r => N(r.lodge?.gpu?.count ?? null, r.lodge?.gpu ? `${r.lodge.gpu.count} @ ${r.lodge.gpu.interval_ms} ms${r.lodge.gpu.failed ? ` <span class="bad">(${r.lodge.gpu.failed} failed)</span>` : ''}` : '—'), 'nvidia-smi calls made by the Lodge server while the stream was open'],
+    ['GPU utilization max / mean', 'NVIDIA', r => N(r.lodge?.gpu?.utilization_gpu_pct_mean ?? null, r.lodge?.gpu ? `${r.lodge.gpu.utilization_gpu_pct_max ?? '—'} % / ${r.lodge.gpu.utilization_gpu_pct_mean ?? '—'} %` : '—'), 'utilization.gpu over samples — ratio column uses the mean'],
+    ['power draw max / mean', 'NVIDIA', r => N(r.lodge?.gpu?.power_draw_w_mean ?? null, r.lodge?.gpu ? `${r.lodge.gpu.power_draw_w_max ?? '—'} W / ${r.lodge.gpu.power_draw_w_mean ?? '—'} W` : '—'), 'power.draw over samples — ratio column uses the mean'],
+    ['temperature max', 'NVIDIA', r => N(r.lodge?.gpu?.temperature_c_max ?? null, r.lodge?.gpu ? `${r.lodge.gpu.temperature_c_max ?? '—'} °C` : '—'), 'temperature.gpu over samples'],
+    ['group', 'Stream'],
+    ['stream chunks', 'Lodge', r => N(r.chunks, fmtNum(r.chunks)), 'browser count of NDJSON lines'],
+    ['ended with', 'Lodge', r => N(null, r.error ? `<span class="bad">${esc(r.error)}</span>` : 'ok'), ''],
+  ];
+}
+
+function renderComparison(runs) {
+  if (!runs.length) { $('cmp').innerHTML = ''; return; }
+  const [a, b] = runs;
+  let html = `<table><tr><th></th><th class="kind">kind</th><th class="col">A: ${esc(a.model)}</th>${b ? `<th class="col">B: ${esc(b.model)}</th><th class="col">B ÷ A</th>` : ''}<th>source</th></tr>`;
+  for (const row of comparisonRows()) {
+    if (row[0] === 'group') { html += `<tr class="grp"><th colspan="6">${esc(row[1])}</th></tr>`; continue; }
+    const [label, kind, fn, note] = row;
+    const va = fn(a), vb = b ? fn(b) : null;
+    let ratio = '';
+    if (vb && va.n != null && vb.n != null && va.n !== 0 && Number.isFinite(va.n) && Number.isFinite(vb.n)) ratio = (vb.n / va.n).toFixed(2) + '×';
+    const noteText = typeof note === 'function' ? [a, b].filter(Boolean).map(note).filter((x, i, arr) => arr.indexOf(x) === i).join(' · ') : note;
+    html += `<tr><th>${esc(label)}</th><td class="kind"><kbd class="k">${esc(kind)}</kbd></td><td class="v">${va.text}</td>${b ? `<td class="v">${vb.text}</td><td class="v muted">${ratio}</td>` : ''}<td class="src">${esc(noteText ?? '')}</td></tr>`;
+  }
+  html += '</table>';
+  html += `<div class="note">prompt: ${esc(runs[0].prompt.length)} chars · runs started ${runs.map(r => `${r.label} ${new Date(r.started_at).toLocaleTimeString()}`).join(', ')} · after-run snapshot errors: ${runs.map(r => r.lodge?.after?.errors?.length ?? '?').join(' / ')}</div>`;
+  $('cmp').innerHTML = html;
+}
+</script>
+</body>
+</html>
