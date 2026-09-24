@@ -49,6 +49,11 @@
   #cmp td.kind { color:var(--muted); font-size:12px; white-space:nowrap; }
   #cmp td.v { white-space:nowrap; }
   #cmp tr.grp th { padding-top:10px; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; font-size:11px; }
+  #repTable table { font-size:12px; }
+  #repTable th, #repTable td { white-space:nowrap; padding-right:10px; }
+  #repTable td.v { text-align:right; }
+  #repTable tr.sum td, #repTable tr.sum th { border-top:1px solid var(--line); color:var(--muted); }
+  #repTable tr.sum.first td, #repTable tr.sum.first th { border-top:2px solid var(--fg); }
   kbd.k { font:11px var(--mono); padding:1px 5px; border:1px solid var(--line); border-radius:3px; background:#f4f4f4; }
 </style>
 </head>
@@ -129,6 +134,32 @@
     </div>
   </section>
 
+  <section class="wide">
+    <h2>Repeat <span class="src">— Mission 004: one model, one prompt, fixed options, N runs. Every run is kept; the summary sits under the rows, never instead of them.</span></h2>
+    <div class="row">
+      <label>model <select id="repModel"></select></label>
+      <label>series <select id="repKind">
+        <option value="W">W — warm: reset to zero runner, load once, then N back-to-back runs</option>
+        <option value="C">C — runner-cold: unload + zero runner in nvidia-smi before every run</option>
+        <option value="O">O — as W, with the Lodge in-stream GPU sampler off</option>
+      </select></label>
+      <label>N <input id="repN" type="number" min="1" max="50" value="10" style="width:4em"></label>
+      <button id="runRep">Run series</button>
+      <button id="stopRep" disabled>Stop</button>
+      <button id="saveRep" disabled>Download JSON</button>
+      <span id="repStatus"><span class="dot"></span>idle</span>
+    </div>
+    <div class="src" id="repFixed"></div>
+    <textarea id="repPrompt">You are helping a small team design a local-first note-taking app. Write a concise design memo covering: (1) the data model for notes, tags and links between notes; (2) how full-text search should work offline; (3) a conflict-resolution strategy for syncing between two devices that were both edited while offline. Give one concrete example for each section. Keep it under 500 words.</textarea>
+    <div id="repTable"></div>
+    <div class="note">
+      <b>Runner-cold</b> = no Ollama runner process on the GPU (nvidia-smi) and nothing in /api/ps. It is <b>not</b> disk-cold: the model file may still be in the OS page cache. ·
+      The 1 s browser poll is paused while a series runs; the only nvidia-smi calls during a stream are the server sampler's (off in series O). ·
+      <kbd class="k">obs</kbd> = /api/state requests the server answered while the stream was open (should be 0). ·
+      spread = (max − min) ÷ median.
+    </div>
+  </section>
+
 </div>
 
 <script>
@@ -152,7 +183,9 @@ let sawUnload = false;        // observed loaded → not loaded transition
 let inference = { active:false, controller:null, firstContentAtClient:null, chunks:0, stopped:false };
 
 // ------------------------------------------------------------ polling
+let pollPaused = false;       // Mission 004: no browser polling while a repeat series runs
 async function poll() {
+  if (pollPaused) return;
   try {
     const r = await fetch('/api/state', { cache:'no-store' });
     lastState = await r.json();
@@ -197,12 +230,12 @@ function renderStored(models) {
 
   // keep model selectors in sync
   const names = models.map(m => m.name);
-  for (const [id, dflt] of [['model', 0], ['modelA', 0], ['modelB', 1]]) {
+  for (const [id, dflt] of [['model', 0], ['modelA', 0], ['modelB', 1], ['repModel', 'qwen3:8b']]) {
     const sel = $(id);
     if (sel.options.length !== names.length || [...sel.options].some((o, i) => o.value !== names[i])) {
       const cur = sel.value;
       sel.innerHTML = names.map(n => `<option>${esc(n)}</option>`).join('');
-      sel.value = names.includes(cur) ? cur : (names[dflt] ?? names[0] ?? '');
+      sel.value = names.includes(cur) ? cur : names.includes(dflt) ? dflt : (names[dflt] ?? names[0] ?? '');
     }
   }
 }
@@ -275,13 +308,13 @@ function setStatus(text, active) {
 
 // One streamed /api/generate call. Returns everything measured about it and
 // never throws; errors land in `.error`.
-async function streamGenerate(model, prompt, { signal, onText, onChunk }) {
-  const run = { model, prompt, started_at: new Date().toISOString(), ollama:null, lodge:null, clientTtfcMs:null, chunks:0, error:null };
+async function streamGenerate(model, prompt, { signal, onText, onChunk, options, sample }) {
+  const run = { model, prompt, started_at: new Date().toISOString(), ollama:null, lodge:null, clientTtfcMs:null, clientDoneMs:null, chunks:0, text:'', error:null };
   const tClientStart = performance.now();
   try {
     const r = await fetch('/api/generate', {
       method:'POST', headers:{ 'content-type':'application/json' },
-      body: JSON.stringify({ model, prompt }),
+      body: JSON.stringify({ model, prompt, ...(options ? { options } : {}), ...(sample === false ? { sample:false } : {}) }),
       signal,
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
@@ -303,10 +336,11 @@ async function streamGenerate(model, prompt, { signal, onText, onChunk }) {
         run.chunks++;
         if (j.response) {
           if (run.clientTtfcMs == null) run.clientTtfcMs = performance.now() - tClientStart;
+          run.text += j.response;
           onText?.(j.response);
         }
         onChunk?.(run);
-        if (j.done) run.ollama = j;
+        if (j.done) { run.ollama = j; run.clientDoneMs = performance.now() - tClientStart; }
       }
     }
   } catch (e) {
@@ -554,6 +588,235 @@ function renderComparison(runs) {
   html += `<div class="note">prompt: ${esc(runs[0].prompt.length)} chars · runs started ${runs.map(r => `${r.label} ${new Date(r.started_at).toLocaleTimeString()}`).join(', ')} · after-run snapshot errors: ${runs.map(r => r.lodge?.after?.errors?.length ?? '?').join(' / ')}</div>`;
   $('cmp').innerHTML = html;
 }
+// ------------------------------------------------------------ repeat (Mission 004)
+// Same model, same prompt, same fixed options, N runs. Nothing is discarded,
+// nothing is averaged in place of a row.
+const REPEAT_OPTIONS = { temperature:0, seed:42, num_predict:400, num_ctx:4096 };
+const REPEAT_GAP_MS = 5000;          // fixed pause after each stream closes
+const RESET_POLL_MS = 250;           // resolution of the unload-visibility timings
+const RUNNER_RE = /ollama|llama/i;
+let series = null;
+$('repFixed').textContent = `fixed options → ${JSON.stringify(REPEAT_OPTIONS)}, think:false (server) · gap after each run ${REPEAT_GAP_MS / 1000} s · browser poll paused during the series`;
+
+const getStateNow = async (signal) => (await fetch('/api/state', { cache:'no-store', signal })).json();
+const runnerProcs = (st) => st.gpu.processes == null ? null : st.gpu.processes.filter(p => RUNNER_RE.test(p.process_name));
+
+// Unload every resident model, then wait until /api/ps is empty AND nvidia-smi
+// shows no runner process. Times are from the first unload request.
+async function resetToZeroRunner(signal) {
+  const rec = { requested:[], ps_empty_after_ms:null, runner_gone_after_ms:null, poll_ms:RESET_POLL_MS, timed_out:false };
+  const s0 = await getStateNow(signal);
+  const t0 = performance.now();
+  for (const m of s0.ollama.loaded ?? []) {
+    const r = await fetch('/api/unload', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ model:m.name }), signal });
+    rec.requested.push({ model:m.name, http:r.status });
+  }
+  while (performance.now() - t0 < 30000) {
+    const st = await getStateNow(signal);
+    const el = performance.now() - t0;
+    if (rec.ps_empty_after_ms == null && Array.isArray(st.ollama.loaded) && st.ollama.loaded.length === 0) rec.ps_empty_after_ms = el;
+    const rp = runnerProcs(st);
+    if (rec.ps_empty_after_ms != null && rp && rp.length === 0) { rec.runner_gone_after_ms = el; break; }
+    await sleep(RESET_POLL_MS);
+  }
+  if (rec.runner_gone_after_ms == null) rec.timed_out = true;
+  return rec;
+}
+
+function startState(st) {
+  const d = st.gpu.devices?.[0] ?? null;
+  return {
+    taken_at: st.timestamp,
+    pstate: d?.pstate ?? null, clocks_sm_mhz: d?.clocks_sm_mhz ?? null, clocks_mem_mhz: d?.clocks_mem_mhz ?? null,
+    clock_event_reasons: d?.clock_event_reasons ?? null, temperature_c: d?.temperature_c ?? null,
+    memory_used_mib: d?.memory_used_mib ?? null, power_draw_w: d?.power_draw_w ?? null, utilization_gpu_pct: d?.utilization_gpu_pct ?? null,
+    runner_processes: runnerProcs(st), loaded: st.ollama.loaded == null ? null : st.ollama.loaded.map(m => m.name),
+    errors: st.errors,
+  };
+}
+
+async function sha256(text) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+function setRepStatus(text, active) {
+  $('repStatus').innerHTML = `<span class="dot ${active ? 'active' : ''}"></span>${esc(text)}`;
+  $('repStatus').className = active ? 'active' : '';
+  $('runRep').disabled = active;
+  $('stopRep').disabled = !active;
+  $('saveRep').disabled = active || !series?.runs.length;
+  for (const id of ['generate', 'unload', 'runExp']) $(id).disabled = active;
+}
+
+async function runSeries(kind, model, prompt, n) {
+  const ac = new AbortController();
+  series = {
+    mission:'004', kind, model, prompt, n, options:{ ...REPEAT_OPTIONS }, think:false,
+    sampler_enabled: kind !== 'O', gap_ms: REPEAT_GAP_MS, browser_poll_paused: true,
+    started_at: new Date().toISOString(), finished_at:null, user_agent: navigator.userAgent,
+    setup:null, runs:[], stopped:false, error:null, controller:ac,
+  };
+  const { signal } = ac;
+  const sample = series.sampler_enabled;
+  pollPaused = true;
+  renderRepeat(series);
+  try {
+    if (kind !== 'C') {
+      // W / O: start from zero runner, then one explicit load with an empty
+      // prompt. Recorded in `setup`; it is not a run and nothing is dropped.
+      setRepStatus(`${kind}: reset to zero runner…`, true);
+      const reset = await resetToZeroRunner(signal);
+      setRepStatus(`${kind}: loading ${model} (empty prompt)…`, true);
+      const load = await streamGenerate(model, '', { signal, options: REPEAT_OPTIONS, sample });
+      series.setup = { reset, load: { ollama: load.ollama, lodge: load.lodge, error: load.error, client_total_ms: load.clientTotalMs } };
+      if (load.error) throw new Error('setup load: ' + load.error);
+    }
+    let prevEnd = performance.now();
+    for (let i = 1; i <= n && !series.stopped; i++) {
+      const wait = REPEAT_GAP_MS - (performance.now() - prevEnd);
+      setRepStatus(`${kind}: run ${i}/${n} — gap`, true);
+      if (wait > 0) await sleep(wait);
+      let reset = null;
+      if (kind === 'C') {
+        setRepStatus(`${kind}: run ${i}/${n} — unloading, waiting for zero runner…`, true);
+        reset = await resetToZeroRunner(signal);
+      }
+      const start = startState(await getStateNow(signal));
+      const gap = performance.now() - prevEnd;
+      setRepStatus(`${kind}: run ${i}/${n} — generating`, true);
+      const run = await streamGenerate(model, prompt, { signal, options: REPEAT_OPTIONS, sample });
+      prevEnd = performance.now();
+      Object.assign(run, { series: kind, index: i, gap_before_ms: gap, reset, start, sha256: await sha256(run.text) });
+      series.runs.push(run);
+      renderRepeat(series);
+      if (run.error) { series.error = run.error; break; }
+    }
+  } catch (e) {
+    series.error = e.name === 'AbortError' ? 'stopped by user' : e.message;
+  } finally {
+    series.finished_at = new Date().toISOString();
+    pollPaused = false;
+    setRepStatus(series.error ? `ended: ${series.error}` : `done — ${series.runs.length} runs`, false);
+    renderRepeat(series);
+    poll();
+  }
+  return series;
+}
+
+// Columns: [label, kind, fn(run) → value, format]. Numeric values get a summary.
+const nz = (x) => x == null ? null : x;
+const tokps = (c, dns) => c != null && dns ? c / (dns / 1e9) : null;
+function repeatColumns() {
+  const o = (r) => r.ollama ?? {};
+  const g = (r) => r.lodge?.gpu ?? {};
+  const ms = (x) => fmtMs(x);
+  const f1 = (x) => x == null ? '—' : x.toFixed(1);
+  const i0 = (x) => x == null ? '—' : Math.round(x).toLocaleString();
+  const txt = (x) => esc(x ?? '—');
+  return [
+    ['#', 'Lodge', r => r.index, i0],
+    ['gap', 'Lodge', r => r.gap_before_ms, ms],
+    ['start P / SM MHz / °C', 'NVIDIA', r => `${r.start?.pstate ?? '—'} / ${r.start?.clocks_sm_mhz ?? '—'} / ${r.start?.temperature_c ?? '—'}`, txt],
+    ['start dev mem', 'NVIDIA', r => r.start?.memory_used_mib, fmtMiB],
+    ['start runners', 'NVIDIA', r => r.start?.runner_processes?.length, i0],
+    ['ps empty after', 'Lodge', r => r.reset?.ps_empty_after_ms, ms],
+    ['runner gone after', 'Lodge', r => r.reset?.runner_gone_after_ms, ms],
+    ['load', 'Ollama', r => nsToMs(o(r).load_duration), ms],
+    ['prompt eval tok', 'Ollama', r => o(r).prompt_eval_count, i0],
+    ['cached tok', 'Ollama', r => o(r).prompt_eval_cached_count, i0],
+    ['prompt eval', 'Ollama', r => nsToMs(o(r).prompt_eval_duration), ms],
+    ['eval tok', 'Ollama', r => o(r).eval_count, i0],
+    ['eval', 'Ollama', r => nsToMs(o(r).eval_duration), ms],
+    ['tok/s', 'derived', r => tokps(o(r).eval_count, o(r).eval_duration), f1],
+    ['TTFC server', 'Lodge', r => r.lodge?.first_content_ms, ms],
+    ['TTFC browser', 'Lodge', r => r.clientTtfcMs, ms],
+    ['total', 'Ollama', r => nsToMs(o(r).total_duration), ms],
+    ['wall → done', 'Lodge', r => r.clientDoneMs, ms],
+    ['wall → close', 'Lodge', r => r.clientTotalMs, ms],
+    ['done', 'Ollama', r => o(r).done_reason, txt],
+    ['VRAM Ollama', 'Ollama', r => r.lodge?.after?.ps_model?.size_vram == null ? null : r.lodge.after.ps_model.size_vram / 2 ** 20, i0],
+    ['runner VRAM', 'NVIDIA', r => { const p = r.lodge?.after?.runner_processes; return p?.length ? p.reduce((a, x) => a + (x.used_memory_mib ?? 0), 0) : null; }, i0],
+    ['P-states', 'NVIDIA', r => g(r).pstates?.join(' '), txt],
+    ['SM MHz min', 'NVIDIA', r => g(r).clocks_sm_mhz_min, i0],
+    ['SM MHz max', 'NVIDIA', r => g(r).clocks_sm_mhz_max, i0],
+    ['mem MHz max', 'NVIDIA', r => g(r).clocks_mem_mhz_max, i0],
+    ['clock reasons', 'NVIDIA', r => g(r).clock_event_reasons?.join(' ') || (g(r).disabled ? 'off' : g(r).clock_event_reasons ? 'none' : null), txt],
+    ['W mean', 'NVIDIA', r => g(r).power_draw_w_mean, f1],
+    ['°C max', 'NVIDIA', r => g(r).temperature_c_max, i0],
+    ['samples', 'Lodge', r => g(r).disabled ? null : g(r).count, i0],
+    ['obs', 'Lodge', r => r.lodge?.state_requests_during_stream, i0],
+    ['sha256', 'derived', r => r.sha256?.slice(0, 12), txt],
+  ];
+}
+
+function median(a) { const s = [...a].sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
+
+function repeatSummary(runs) {
+  return repeatColumns().map(([label, , fn]) => {
+    if (label === '#') return null;
+    const v = runs.map(fn).filter(x => typeof x === 'number' && Number.isFinite(x));
+    if (!v.length) return null;
+    const min = Math.min(...v), max = Math.max(...v), med = median(v);
+    return { label, n: v.length, min, median: med, max, spread_pct: med ? (max - min) / med * 100 : null };
+  });
+}
+
+function renderRepeat(s) {
+  const el = $('repTable');
+  if (!s) { el.innerHTML = ''; return; }
+  const cols = repeatColumns();
+  let html = `<div class="note">series ${esc(s.kind)} · ${esc(s.model)} · N=${s.n} · sampler ${s.sampler_enabled ? 'on' : 'off'} · started ${new Date(s.started_at).toLocaleTimeString()}`;
+  if (s.setup) {
+    const r = s.setup.reset, l = s.setup.load;
+    html += ` · setup: unloaded ${r.requested.map(x => esc(x.model)).join(', ') || 'nothing'}, runner gone after ${fmtMs(r.runner_gone_after_ms)}${r.timed_out ? ' <span class="bad">TIMED OUT</span>' : ''}; load ${fmtMs(nsToMs(l.ollama?.load_duration))} (${esc(l.ollama?.done_reason ?? l.error ?? '?')})`;
+  }
+  html += '</div><div style="overflow-x:auto"><table><tr>' + cols.map(([l, k]) => `<th title="${esc(k)}">${esc(l)}<br><kbd class="k">${esc(k)}</kbd></th>`).join('') + '</tr>';
+  for (const r of s.runs) {
+    html += '<tr>' + cols.map(([l, , fn, fmt]) => {
+      let cell = fmt(fn(r));
+      if (l === 'done' && r.ollama?.done_reason !== 'length') cell = `<span class="bad">${cell}</span>`;
+      if (l === 'start runners' && s.kind === 'C' && fn(r) !== 0) cell = `<span class="bad">${cell}</span>`;
+      if (l === 'obs' && fn(r)) cell = `<span class="bad">${cell}</span>`;
+      return `<td class="v">${cell}</td>`;
+    }).join('') + '</tr>';
+  }
+  if (s.runs.length) {
+    const sum = repeatSummary(s.runs);
+    const fmts = Object.fromEntries(cols.map(([l, , , f]) => [l, f]));
+    for (const [i, stat] of ['min', 'median', 'max', 'spread_pct'].entries()) {
+      html += `<tr class="sum${i === 0 ? ' first' : ''}">` + cols.map(([l], ci) => {
+        if (ci === 0) return `<th>${stat === 'spread_pct' ? 'spread' : stat}</th>`;
+        const x = sum[ci];
+        if (!x) return '<td></td>';
+        return `<td class="v">${stat === 'spread_pct' ? (x.spread_pct == null ? '—' : x.spread_pct.toFixed(1) + ' %') : fmts[l](x[stat])}</td>`;
+      }).join('') + '</tr>';
+    }
+  }
+  html += '</table></div>';
+  el.innerHTML = html;
+}
+
+// The full series — settings, every run, every GPU sample, full response text.
+function seriesJson(s) {
+  const { controller, ...rest } = s;
+  return JSON.stringify({ ...rest, summary: repeatSummary(s.runs).filter(Boolean) }, null, 2);
+}
+
+$('runRep').onclick = () => {
+  const model = $('repModel').value, prompt = $('repPrompt').value, n = Math.max(1, Math.min(50, Number($('repN').value) || 10));
+  if (!model || !prompt.trim()) return;
+  runSeries($('repKind').value, model, prompt, n);
+};
+$('stopRep').onclick = () => { if (series) { series.stopped = true; series.controller.abort(); } };
+$('saveRep').onclick = () => {
+  if (!series) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([seriesJson(series)], { type:'application/json' }));
+  a.download = `lodge-m004-${series.kind}-${series.started_at.replace(/[:.]/g, '-')}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+};
 </script>
 </body>
 </html>

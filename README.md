@@ -9,8 +9,9 @@ STORED → LOADED → INFERENCING → TOKENS → UNLOADED
 
 It is not an application yet. It is one page that shows, with every number
 traced to a real local source, what Ollama and the GPU are actually doing —
-and, since Mission 003, lets you run the same prompt against two installed
-models back-to-back and compare what was measured.
+since Mission 003, lets you run the same prompt against two installed
+models back-to-back and compare what was measured, and since Mission 004,
+lets you repeat one fixed run N times to see how stable each number is.
 
 ## Run
 
@@ -39,16 +40,22 @@ Ollama ──────┘
     returns them side by side. A failed source becomes `null` plus an entry in
     `errors`; the others still return.
   - `POST /api/generate` proxies Ollama `/api/generate` with `stream:true` and
-    `think:false` forced. Ollama's NDJSON lines are forwarded byte-for-byte.
+    `think:false` forced. `options` are passed through; `sample:false` turns the
+    in-stream GPU sampler off (Mission 004 series O). Ollama's NDJSON lines are forwarded byte-for-byte.
     One extra line `{"lodge": {...}}` is appended at the end containing:
     - the server-side timings described below;
     - `gpu`: every `nvidia-smi` sample the server took while the stream was
       open (one every 500 ms: utilization, power, memory.used, temperature,
-      and the `used_memory` of `ollama`/`llama-server` compute processes),
+      pstate, SM/memory clocks, `clocks_event_reasons.active` — the current
+      name for throttle reasons — and the `used_memory` of
+      `ollama`/`llama-server` compute processes),
       plus max/mean over those samples and a `failed` count. Nothing is
       interpolated — a failed sample is simply missing;
     - `after`: an `/api/ps` entry for the model and a `nvidia-smi` read taken
-      immediately after the stream closed, each `null` if that source failed.
+      immediately after the stream closed, each `null` if that source failed;
+    - `state_requests_during_stream`: how many `/api/state` requests the server
+      answered while the stream was open. Anything above 0 means another
+      observer (a browser tab, curl) was running `nvidia-smi` during the run.
   - `POST /api/unload` sends `{model, keep_alive: 0}` to Ollama `/api/generate`.
 - `public/index.html` — plain HTML/CSS/JS. Polls `/api/state` every 1 s.
   Streams generations with `fetch` + `ReadableStream`. The **Experiment**
@@ -69,7 +76,7 @@ Every value on the page has a source label next to it. Summary:
 | Loaded | total footprint | `/api/ps` → `size` |
 | Loaded | **effective context** | `/api/ps` → `context_length` — what *this load* was given (4096 by default here) |
 | Loaded | keep-alive expiry | `/api/ps` → `expires_at` |
-| GPU | utilization % | `nvidia-smi --query-gpu=utilization.gpu` — % of the last sample period a kernel was executing |
+| GPU | utilization % | `nvidia-smi --query-gpu=utilization.gpu` — % of the last sample period a kernel was executing. **Lags by seconds on this card; see Mission 004** |
 | GPU | **VRAM used (NVIDIA)** | `--query-gpu=memory.used` — the whole device, all processes, including the desktop |
 | GPU | free / total, temp, power | `memory.free`, `memory.total`, `temperature.gpu`, `power.draw`, `power.limit` |
 | GPU | compute processes | `nvidia-smi --query-compute-apps=pid,process_name,used_memory` — `llama-server` is Ollama's runner |
@@ -132,8 +139,10 @@ Things to know when reading a comparison:
   first-ever load of a model reads from NVMe; a repeat cold load reads from
   RAM. Both are real `load_duration` values — they just measure different
   things. Run the experiment twice if you want the second kind.
-- **GPU utilization from `nvidia-smi` is coarse.** It is the fraction of the
-  last sample period in which any kernel ran, sampled at 500 ms. Prompt eval
+- **GPU utilization from `nvidia-smi` is coarse — and, as Mission 004 found,
+  stale.** It is the fraction of the last sample period in which any kernel
+  ran, sampled at 500 ms, but on this card it lags the real load by seconds:
+  runs at ~317 W read 0 % for their whole duration. Prompt eval
   and generation both keep it near 100 % on this card; the *mean* includes the
   load phase, when it is near 0 %. Power draw is the more graded signal.
 - **Runner VRAM (NVIDIA) vs VRAM allocated (Ollama)** differ for the reason
@@ -152,6 +161,60 @@ Things to know when reading a comparison:
 - Two models of the same family and quantization share a tokenizer, so
   `prompt tokens` should be identical across A and B. If it is not, the
   models differ in more than size.
+
+The M003 figures (qwen3:8b 151 tok/s, qwen3:14b 89 tok/s) are **single runs
+with the models' default random sampling**, so the two outputs had different
+text. Mission 004 measured qwen3:8b's decode rate properly (below); the 14b
+figure has not been re-measured.
+
+## Mission 004: repeatability
+
+Question: with model, prompt, options, context and output length held fixed,
+how much do Lodge's numbers still move from run to run, and why?
+
+The **Repeat** panel runs one model and one prompt N times with fixed options
+`{temperature:0, seed:42, num_predict:400, num_ctx:4096}` (plus `think:false`),
+a fixed 5 s pause after each stream, and the browser's 1 s poll paused. Every
+run is a row; min / median / max / spread (= (max − min) ÷ median) sit under
+the rows. **Download JSON** saves the whole series: settings, every run, every
+GPU sample and the full response text. Three series:
+
+| series | before each run | purpose |
+|---|---|---|
+| **W** | reset to zero runner, load once (empty prompt, recorded as `setup`), then N back-to-back runs | natural spread; prompt-cache effect |
+| **C** | unload, then wait until `/api/ps` is empty **and** no runner process is left in `nvidia-smi` | load-time spread; whether VRAM is exact |
+| **O** | same as W, with the server's in-stream GPU sampler off | whether Lodge's measuring changes the result |
+
+**Runner-cold** means no Ollama runner on the GPU and nothing in `/api/ps`. It
+is **not** disk-cold: the model file stays in the OS page cache (32 GB RAM).
+
+Results (qwen3:8b Q4_K_M, RTX 5080, 2026-09-24, W N=10, C N=5, O N=10) are in
+`experiments/m004/`. Headlines:
+
+- **Decode rate is stable to about 1 %.** W 151.9–153.5 tok/s (median 153.1,
+  spread 1.05 %), O 151.6–153.3 (1.08 %), C 151.2–152.3 (0.74 %).
+- **Runner-cold load is stable too:** 1684–1710 ms (1.5 %), from page cache.
+- **VRAM is exact.** Every run: Ollama `size_vram` 5319.8 MiB, runner 5666 MiB
+  per NVIDIA (a 346 MiB gap).
+- **"Warm" has two layers.** From run 2 of a warm series on, 98 of 99 prompt
+  tokens come from the prefix cache: prompt eval drops from ~80 ms to 7.5 ms and
+  time to first content from ~87 ms to 10–15 ms.
+- **Greedy output is deterministic per cache state, not overall.** Every
+  uncached run produced identical text (sha256 `e4277f5a…`), and every cached
+  run produced identical text (`153ec0b6…`). The two differ from about character
+  140 on.
+- **Observer effect:** none measurable on tok/s. The sampler adds about 3 ms to
+  time to first content on cached runs (W 13–15 ms vs O 10–12 ms).
+- **GPU state:** P1 throughout, SM 2902–2917 MHz while decoding, ~310–319 W of a
+  360 W limit, no clock-event (throttle) reasons in any sample, 53 → 60 °C
+  with no effect on tok/s.
+- **Unexplained:** on cached runs 2 and 3 of both W and O (never later, never
+  in C), Ollama's `total_duration` contains about 20 ms that is not load,
+  prompt eval or eval, and time to first content rises by the same amount.
+
+`experiments/m004/pilot/` holds the harness pilot (W N=2, O N=1) that was run
+before the real series. An earlier pilot, which exposed a missing newline
+before the lodge line after a load-only request, was overwritten and not kept.
 
 ## Offline-first
 

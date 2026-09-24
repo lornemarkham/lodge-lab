@@ -49,7 +49,30 @@ const GPU_FIELDS = [
   'temperature.gpu',
   'power.draw',
   'power.limit',
+  'pstate',
+  'clocks.sm',
+  'clocks.mem',
+  'clocks_event_reasons.active', // current name for clocks_throttle_reasons.active
 ];
+
+// Bits of clocks_event_reasons.active (nvidia-smi --help-query-gpu).
+const CLOCK_EVENT_BITS = [
+  [0x1, 'gpu_idle'],
+  [0x2, 'applications_clocks_setting'],
+  [0x4, 'sw_power_cap'],
+  [0x8, 'hw_slowdown'],
+  [0x10, 'sync_boost'],
+  [0x20, 'sw_thermal_slowdown'],
+  [0x40, 'hw_thermal_slowdown'],
+  [0x80, 'hw_power_brake_slowdown'],
+  [0x100, 'display_clock_setting'],
+];
+
+function clockEventNames(hex) {
+  const n = Number(hex); // "0x0000000000000004" → 4; "[N/A]" → NaN
+  if (!Number.isFinite(n)) return null;
+  return CLOCK_EVENT_BITS.filter(([bit]) => n & bit).map(([, name]) => name);
+}
 
 const PROC_FIELDS = ['gpu_uuid', 'pid', 'process_name', 'used_memory'];
 
@@ -92,6 +115,11 @@ async function gpuQuery() {
     temperature_c: num(r[8]),
     power_draw_w: num(r[9]),
     power_limit_w: num(r[10]),
+    pstate: r[11] ?? null,
+    clocks_sm_mhz: num(r[12]),
+    clocks_mem_mhz: num(r[13]),
+    clock_event_reasons_hex: r[14] ?? null,
+    clock_event_reasons: clockEventNames(r[14]),
   }));
 }
 
@@ -160,6 +188,7 @@ function startGpuSampler(t0) {
   const samples = [];
   let failed = 0;
   let running = true;
+  let wake = null;
   const loop = (async () => {
     while (running) {
       const tick = performance.now();
@@ -173,6 +202,10 @@ function startGpuSampler(t0) {
             power_draw_w: d.power_draw_w,
             memory_used_mib: d.memory_used_mib,
             temperature_c: d.temperature_c,
+            pstate: d.pstate,
+            clocks_sm_mhz: d.clocks_sm_mhz,
+            clocks_mem_mhz: d.clocks_mem_mhz,
+            clock_event_reasons_hex: d.clock_event_reasons_hex,
             runner_used_memory_mib: procs
               .filter((p) => RUNNER_RE.test(p.process_name))
               .reduce((a, p) => a + (p.used_memory_mib ?? 0), 0) || null,
@@ -182,15 +215,17 @@ function startGpuSampler(t0) {
         failed++;
       }
       const wait = GPU_SAMPLE_MS - (performance.now() - tick);
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (wait > 0 && running) await new Promise((r) => { wake = r; setTimeout(r, wait); });
     }
   })();
   return {
     async stop() {
       running = false;
+      wake?.(); // don't hold the stream open for the rest of an idle wait
       await loop;
       const col = (k) => samples.map((x) => x[k]).filter((v) => v != null);
       const max = (a) => (a.length ? Math.max(...a) : null);
+      const min = (a) => (a.length ? Math.min(...a) : null);
       const mean = (a) => (a.length ? round(a.reduce((x, y) => x + y, 0) / a.length) : null);
       return {
         source: 'nvidia-smi --query-gpu / --query-compute-apps, sampled by Lodge server during the stream',
@@ -204,6 +239,12 @@ function startGpuSampler(t0) {
         memory_used_mib_max: max(col('memory_used_mib')),
         runner_used_memory_mib_max: max(col('runner_used_memory_mib')),
         temperature_c_max: max(col('temperature_c')),
+        clocks_sm_mhz_min: min(col('clocks_sm_mhz')),
+        clocks_sm_mhz_max: max(col('clocks_sm_mhz')),
+        clocks_mem_mhz_min: min(col('clocks_mem_mhz')),
+        clocks_mem_mhz_max: max(col('clocks_mem_mhz')),
+        pstates: [...new Set(col('pstate'))],
+        clock_event_reasons: [...new Set(col('clock_event_reasons_hex').flatMap((h) => clockEventNames(h) ?? []))],
         samples,
       };
     },
@@ -236,6 +277,7 @@ async function handleGenerate(req, res) {
     think: false, // first slice: no thinking tokens
   };
   if (body.options && typeof body.options === 'object') upstreamBody.options = body.options;
+  const sample = body.sample !== false; // Mission 004 series O turns the in-stream sampler off
 
   const ac = new AbortController();
   req.on('close', () => ac.abort()); // browser navigated away / stop pressed
@@ -247,10 +289,15 @@ async function handleGenerate(req, res) {
     first_chunk_ms: null, // first NDJSON line of any kind
     first_content_ms: null, // first line with non-empty "response" text
     stream_end_ms: null,
+    sampler_enabled: sample,
+    // /api/state requests served while this stream was open — anything > 0 is
+    // another observer (a browser tab, curl) running nvidia-smi during the run.
+    state_requests_during_stream: null,
   };
 
   const t0 = performance.now();
-  const sampler = startGpuSampler(t0);
+  const stateHits0 = stateHits;
+  const sampler = sample ? startGpuSampler(t0) : { stop: async () => ({ disabled: true }) };
   let upstream;
   try {
     upstream = await fetch(`${OLLAMA}/api/generate`, {
@@ -279,6 +326,9 @@ async function handleGenerate(req, res) {
 
   const decoder = new TextDecoder();
   let buffer = '';
+  // Ollama's reply to an empty-prompt (load-only) request has no trailing
+  // newline; the lodge line must still start on its own line.
+  let endsWithNewline = true;
   try {
     for await (const chunk of upstream.body) {
       const now = performance.now();
@@ -286,6 +336,7 @@ async function handleGenerate(req, res) {
 
       // Forward bytes exactly as received.
       res.write(chunk);
+      if (chunk.length) endsWithNewline = chunk[chunk.length - 1] === 0x0a;
 
       // Inspect (do not modify) complete lines for the first content token.
       if (lodge.first_content_ms === null) {
@@ -308,9 +359,10 @@ async function handleGenerate(req, res) {
       }
     }
     lodge.stream_end_ms = round(performance.now() - t0);
+    lodge.state_requests_during_stream = stateHits - stateHits0;
     lodge.gpu = await sampler.stop();
     lodge.after = await snapshotAfter(body.model);
-    res.write(JSON.stringify({ lodge }) + '\n');
+    res.write((endsWithNewline ? '' : '\n') + JSON.stringify({ lodge }) + '\n');
   } catch (e) {
     lodge.gpu = await sampler.stop();
     if (!ac.signal.aborted) {
@@ -399,6 +451,8 @@ function sendJson(res, status, obj) {
   res.end(payload);
 }
 
+let stateHits = 0;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   try {
@@ -408,6 +462,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(html);
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
+      stateHits++;
       return sendJson(res, 200, await getState());
     }
     if (req.method === 'POST' && url.pathname === '/api/generate') {
