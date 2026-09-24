@@ -216,6 +216,64 @@ Results (qwen3:8b Q4_K_M, RTX 5080, 2026-09-24, W N=10, C N=5, O N=10) are in
 before the real series. An earlier pilot, which exposed a missing newline
 before the lodge line after a load-only request, was overwritten and not kept.
 
+## Mission 005: quantization, Q4_K_M vs Q8_0
+
+Question: on this card, what does Q8_0 cost and buy over Q4_K_M for the same
+model, measured with the M004 harness and judged against M004's noise floor?
+
+Artifacts (exact metadata in `experiments/m005/models.json`):
+
+| | `qwen3:8b` (= `qwen3:8b-q4_K_M`) | `qwen3:8b-q8_0` |
+|---|---|---|
+| weights blob | `sha256:a3de86cd1c13…` | `sha256:d87f4a5a2f1a…` |
+| GGUF file_type | 15 (Q4_K_M) | 7 (Q8_0) |
+| size on disk | 5,225,388,164 B | 8,851,089,538 B |
+| parameters | 8,190,735,360 | 8,190,735,360 |
+| template / params / license layers | identical | identical |
+
+Only the weights differ, so the chat template and default sampling are the same.
+
+The **Q** series in the Repeat panel runs model A and model B in n pairs, in
+A B B A order so neither model always goes first. **Every run starts
+runner-cold and prompt-uncached**: unload, then wait until `/api/ps` is empty
+and no runner is left in `nvidia-smi`. Everything else matches M004: the prompt,
+`{temperature:0, seed:42, num_predict:400, num_ctx:4096}`, the 5 s gap, the
+500 ms sampler and the paused browser poll. Before the runs, each model is
+loaded once with an empty prompt to prime the page cache. These priming loads
+are recorded in `setup.priming` and are not runs. Under the per-run rows, an
+**A | B** table gives median [min – max] for each model, with B − A and B ÷ A
+of the medians. `utilization.gpu` is left out of that table (see M004).
+
+Results (2026-09-24, 10 pairs = 20 runs, `experiments/m005/lodge-m005-Q.json`):
+
+| | Q4_K_M | Q8_0 | Q8 vs Q4 |
+|---|---|---|---|
+| VRAM, Ollama `size_vram` | 5319.8 MiB | 8480.8 MiB | +3161 MiB (×1.59) |
+| of which weights / KV / compute (runner log) | 4643 / 576 / 100 | 7804 / 576 / 100 | all in the weights |
+| runner VRAM (NVIDIA) | 5666 MiB | 8828 MiB | +3162 MiB |
+| device free at peak (16303 MiB card) | 10145 MiB | 6983 MiB | |
+| runner-cold load | 1635 ms [1612–1656] | 1885 ms [1867–1902] | +250 ms (×1.15) |
+| time to first content (server) | 1709 ms [1689–1730] | 1950 ms [1928–1966] | +241 ms (×1.14) |
+| prompt eval, 99 tokens | 69.7 ms [64.3–70.9] | 57.3 ms [54.9–61.7] | −12 ms (×0.82) |
+| decode rate | 151.8 tok/s [150.9–152.3] | 98.9 tok/s [98.7–99.0] | ×0.652 |
+| total duration | 4342 ms [4318–4359] | 5991 ms [5973–6006] | ×1.38 |
+| power, decode phase (median of per-run sample means) | 263 W [257–274] | 232 W [229–237] | −12 % |
+| energy per generated token (derived, coarse) | 1.73 J | 2.34 J | ×1.35 |
+| output | 1 hash in 10 runs (`e4277f5a…`) | 1 hash in 10 runs (`97ac5ec3…`) | differ from character 111 |
+
+- Every difference in the table is well outside M004's noise floor. The
+  decode-rate ranges do not overlap at all.
+- Decode is memory-bandwidth bound: 1.59× the weight bytes gives 1.53× the
+  decode time. Q8_0 draws *less* power while decoding.
+- Q4_K_M's uncached output is byte-identical to M004's uncached output.
+- The two "power mean, decode phase" and "energy per generated token" rows
+  were added to the page after the run. They are computed from the raw
+  `samples` in the JSON, so the file's saved `comparison` block does not
+  include them.
+- The harness pilot (1 pair, `experiments/m005/pilot/`) saw two one-off slow
+  events that did not recur in the real series: Q8_0's first-ever prompt eval
+  took 2954 ms, and the Q4_K_M load right after Q8_0's first load took 3.4 s.
+
 ## Offline-first
 
 Everything talks to `127.0.0.1`. The server binds to `127.0.0.1` only. No

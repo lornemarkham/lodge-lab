@@ -142,7 +142,9 @@
         <option value="W">W — warm: reset to zero runner, load once, then N back-to-back runs</option>
         <option value="C">C — runner-cold: unload + zero runner in nvidia-smi before every run</option>
         <option value="O">O — as W, with the Lodge in-stream GPU sampler off</option>
+        <option value="Q">Q — Mission 005: model vs model B, runner-cold + uncached before every run, A B B A order</option>
       </select></label>
+      <label>B <select id="repModelB"></select> <span class="src">(Q only)</span></label>
       <label>N <input id="repN" type="number" min="1" max="50" value="10" style="width:4em"></label>
       <button id="runRep">Run series</button>
       <button id="stopRep" disabled>Stop</button>
@@ -230,7 +232,7 @@ function renderStored(models) {
 
   // keep model selectors in sync
   const names = models.map(m => m.name);
-  for (const [id, dflt] of [['model', 0], ['modelA', 0], ['modelB', 1], ['repModel', 'qwen3:8b']]) {
+  for (const [id, dflt] of [['model', 0], ['modelA', 0], ['modelB', 1], ['repModel', 'qwen3:8b'], ['repModelB', 'qwen3:8b-q8_0']]) {
     const sel = $(id);
     if (sel.options.length !== names.length || [...sel.options].some((o, i) => o.value !== names[i])) {
       const cur = sel.value;
@@ -649,10 +651,19 @@ function setRepStatus(text, active) {
   for (const id of ['generate', 'unload', 'runExp']) $(id).disabled = active;
 }
 
-async function runSeries(kind, model, prompt, n) {
+async function runSeries(kind, model, prompt, n, modelB = null) {
   const ac = new AbortController();
+  // Q (Mission 005): n pairs, A B then B A alternately, so neither model always
+  // runs first or always follows the other. Every run starts runner-cold.
+  const plan = kind === 'Q'
+    ? Array.from({ length: n }, (_, i) => (i % 2 ? [modelB, model] : [model, modelB])).flat()
+    : Array(n).fill(model);
+  const models = kind === 'Q' ? [model, modelB] : [model];
+  const st0 = await getStateNow(ac.signal);
   series = {
-    mission:'004', kind, model, prompt, n, options:{ ...REPEAT_OPTIONS }, think:false,
+    mission: kind === 'Q' ? '005' : '004', kind, model, ...(kind === 'Q' ? { model_b: modelB, plan } : {}),
+    prompt, n, options:{ ...REPEAT_OPTIONS }, think:false,
+    stored: models.map(m => st0.ollama.stored?.find(x => x.name === m) ?? null), // /api/tags entry: size, digest, details
     sampler_enabled: kind !== 'O', gap_ms: REPEAT_GAP_MS, browser_poll_paused: true,
     started_at: new Date().toISOString(), finished_at:null, user_agent: navigator.userAgent,
     setup:null, runs:[], stopped:false, error:null, controller:ac,
@@ -662,7 +673,19 @@ async function runSeries(kind, model, prompt, n) {
   pollPaused = true;
   renderRepeat(series);
   try {
-    if (kind !== 'C') {
+    if (kind === 'Q') {
+      // Page-cache priming: reset, then load each model once with an empty
+      // prompt, so no measured run is the first read of a file from disk.
+      // Recorded in `setup`; not runs.
+      series.setup = { priming: [] };
+      for (const m of models) {
+        setRepStatus(`Q: priming ${m} — reset, load (empty prompt)…`, true);
+        const reset = await resetToZeroRunner(signal);
+        const load = await streamGenerate(m, '', { signal, options: REPEAT_OPTIONS, sample });
+        series.setup.priming.push({ model: m, reset, load: { ollama: load.ollama, lodge: load.lodge, error: load.error, client_total_ms: load.clientTotalMs } });
+        if (load.error) throw new Error(`priming ${m}: ${load.error}`);
+      }
+    } else if (kind !== 'C') {
       // W / O: start from zero runner, then one explicit load with an empty
       // prompt. Recorded in `setup`; it is not a run and nothing is dropped.
       setRepStatus(`${kind}: reset to zero runner…`, true);
@@ -673,19 +696,20 @@ async function runSeries(kind, model, prompt, n) {
       if (load.error) throw new Error('setup load: ' + load.error);
     }
     let prevEnd = performance.now();
-    for (let i = 1; i <= n && !series.stopped; i++) {
+    for (let i = 1; i <= plan.length && !series.stopped; i++) {
+      const m = plan[i - 1];
       const wait = REPEAT_GAP_MS - (performance.now() - prevEnd);
-      setRepStatus(`${kind}: run ${i}/${n} — gap`, true);
+      setRepStatus(`${kind}: run ${i}/${plan.length} — gap`, true);
       if (wait > 0) await sleep(wait);
       let reset = null;
-      if (kind === 'C') {
-        setRepStatus(`${kind}: run ${i}/${n} — unloading, waiting for zero runner…`, true);
+      if (kind === 'C' || kind === 'Q') {
+        setRepStatus(`${kind}: run ${i}/${plan.length} — unloading, waiting for zero runner…`, true);
         reset = await resetToZeroRunner(signal);
       }
       const start = startState(await getStateNow(signal));
       const gap = performance.now() - prevEnd;
-      setRepStatus(`${kind}: run ${i}/${n} — generating`, true);
-      const run = await streamGenerate(model, prompt, { signal, options: REPEAT_OPTIONS, sample });
+      setRepStatus(`${kind}: run ${i}/${plan.length} — ${m} generating`, true);
+      const run = await streamGenerate(m, prompt, { signal, options: REPEAT_OPTIONS, sample });
       prevEnd = performance.now();
       Object.assign(run, { series: kind, index: i, gap_before_ms: gap, reset, start, sha256: await sha256(run.text) });
       series.runs.push(run);
@@ -716,6 +740,7 @@ function repeatColumns() {
   const txt = (x) => esc(x ?? '—');
   return [
     ['#', 'Lodge', r => r.index, i0],
+    ['model', 'Ollama', r => r.model, txt],
     ['gap', 'Lodge', r => r.gap_before_ms, ms],
     ['start P / SM MHz / °C', 'NVIDIA', r => `${r.start?.pstate ?? '—'} / ${r.start?.clocks_sm_mhz ?? '—'} / ${r.start?.temperature_c ?? '—'}`, txt],
     ['start dev mem', 'NVIDIA', r => r.start?.memory_used_mib, fmtMiB],
@@ -754,7 +779,7 @@ function median(a) { const s = [...a].sort((x, y) => x - y); const m = s.length 
 
 function repeatSummary(runs) {
   return repeatColumns().map(([label, , fn]) => {
-    if (label === '#') return null;
+    if (label === '#' || label === 'model') return null;
     const v = runs.map(fn).filter(x => typeof x === 'number' && Number.isFinite(x));
     if (!v.length) return null;
     const min = Math.min(...v), max = Math.max(...v), med = median(v);
@@ -766,8 +791,10 @@ function renderRepeat(s) {
   const el = $('repTable');
   if (!s) { el.innerHTML = ''; return; }
   const cols = repeatColumns();
-  let html = `<div class="note">series ${esc(s.kind)} · ${esc(s.model)} · N=${s.n} · sampler ${s.sampler_enabled ? 'on' : 'off'} · started ${new Date(s.started_at).toLocaleTimeString()}`;
-  if (s.setup) {
+  let html = `<div class="note">series ${esc(s.kind)} · ${esc(s.model)}${s.model_b ? ` vs ${esc(s.model_b)} · ${s.n} pairs, order ${s.plan.map(m => m === s.model ? 'A' : 'B').join('')}` : ` · N=${s.n}`} · sampler ${s.sampler_enabled ? 'on' : 'off'} · started ${new Date(s.started_at).toLocaleTimeString()}`;
+  if (s.setup?.priming) {
+    html += ' · page-cache priming (not runs): ' + s.setup.priming.map(p => `${esc(p.model)} runner gone ${fmtMs(p.reset.runner_gone_after_ms)}${p.reset.timed_out ? ' <span class="bad">TIMED OUT</span>' : ''}, load ${fmtMs(p.load.client_total_ms)} (${esc(p.load.ollama?.done_reason ?? p.load.error ?? '?')})`).join('; ');
+  } else if (s.setup) {
     const r = s.setup.reset, l = s.setup.load;
     html += ` · setup: unloaded ${r.requested.map(x => esc(x.model)).join(', ') || 'nothing'}, runner gone after ${fmtMs(r.runner_gone_after_ms)}${r.timed_out ? ' <span class="bad">TIMED OUT</span>' : ''}; load ${fmtMs(nsToMs(l.ollama?.load_duration))} (${esc(l.ollama?.done_reason ?? l.error ?? '?')})`;
   }
@@ -781,12 +808,16 @@ function renderRepeat(s) {
       return `<td class="v">${cell}</td>`;
     }).join('') + '</tr>';
   }
-  if (s.runs.length) {
-    const sum = repeatSummary(s.runs);
+  // Q: one summary block per model, so A and B are never pooled.
+  const groups = s.kind === 'Q' ? [s.model, s.model_b].map(m => [m, s.runs.filter(r => r.model === m)]) : [[null, s.runs]];
+  for (const [gm, gruns] of groups) {
+    if (!gruns.length) continue;
+    const sum = repeatSummary(gruns);
     const fmts = Object.fromEntries(cols.map(([l, , , f]) => [l, f]));
     for (const [i, stat] of ['min', 'median', 'max', 'spread_pct'].entries()) {
       html += `<tr class="sum${i === 0 ? ' first' : ''}">` + cols.map(([l], ci) => {
         if (ci === 0) return `<th>${stat === 'spread_pct' ? 'spread' : stat}</th>`;
+        if (ci === 1) return `<td>${gm ? esc(gm) : ''}</td>`;
         const x = sum[ci];
         if (!x) return '<td></td>';
         return `<td class="v">${stat === 'spread_pct' ? (x.spread_pct == null ? '—' : x.spread_pct.toFixed(1) + ' %') : fmts[l](x[stat])}</td>`;
@@ -794,26 +825,116 @@ function renderRepeat(s) {
     }
   }
   html += '</table></div>';
+  if (s.kind === 'Q' && s.runs.length) html += renderQuantCompare(s);
   el.innerHTML = html;
+}
+
+// ------------------------------------------------------------ Mission 005: A | B side by side
+// Every cell is median [min – max] over that model's runs, with n. The delta
+// columns compare medians only; the per-run rows above stay the evidence.
+function quantCompareRows(s) {
+  const o = (r) => r.ollama ?? {};
+  const g = (r) => r.lodge?.gpu ?? {};
+  const a = (r) => r.lodge?.after ?? {};
+  const MiB = (b) => b == null ? null : b / 2 ** 20;
+  return [
+    ['group', 'Model artifact'],
+    ['quantization', 'Ollama', (m) => s.stored[m]?.details?.quantization_level, 'text'],
+    ['digest', 'Ollama', (m) => s.stored[m]?.digest?.slice(0, 12), 'text'],
+    ['size on disk', 'Ollama', (m) => MiB(s.stored[m]?.size), 'MiB', 'static'],
+    ['group', 'Memory (after each run, model resident)'],
+    ['VRAM allocated (Ollama size_vram)', 'Ollama', r => MiB(a(r).ps_model?.size_vram), 'MiB'],
+    ['total footprint (Ollama size)', 'Ollama', r => MiB(a(r).ps_model?.size), 'MiB'],
+    ['share on GPU', 'derived', r => a(r).ps_model?.size ? a(r).ps_model.size_vram / a(r).ps_model.size * 100 : null, '%'],
+    ['runner VRAM (NVIDIA)', 'NVIDIA', r => { const p = a(r).runner_processes; return p?.length ? p.reduce((x, y) => x + (y.used_memory_mib ?? 0), 0) : null; }, 'MiB'],
+    ['device VRAM used, peak in stream', 'NVIDIA', r => g(r).memory_used_mib_max, 'MiB'],
+    ['device VRAM free at that peak', 'derived', r => { const t = a(r).gpu?.memory_total_mib; return t != null && g(r).memory_used_mib_max != null ? t - g(r).memory_used_mib_max : null; }, 'MiB'],
+    ['group', 'Timing'],
+    ['load', 'Ollama', r => nsToMs(o(r).load_duration), 'ms'],
+    ['TTFC server', 'Lodge', r => r.lodge?.first_content_ms, 'ms'],
+    ['TTFC browser', 'Lodge', r => r.clientTtfcMs, 'ms'],
+    ['prompt eval (99 tok)', 'Ollama', r => nsToMs(o(r).prompt_eval_duration), 'ms'],
+    ['prompt eval rate', 'derived', r => tokps(o(r).prompt_eval_count, o(r).prompt_eval_duration), 'tok/s'],
+    ['eval (400 tok)', 'Ollama', r => nsToMs(o(r).eval_duration), 'ms'],
+    ['decode rate', 'derived', r => tokps(o(r).eval_count, o(r).eval_duration), 'tok/s'],
+    ['total', 'Ollama', r => nsToMs(o(r).total_duration), 'ms'],
+    ['wall → done', 'Lodge', r => r.clientDoneMs, 'ms'],
+    ['group', 'GPU during the stream (utilization.gpu omitted: lags by seconds, see M004)'],
+    ['power mean, whole stream', 'NVIDIA', r => g(r).power_draw_w_mean, 'W'],
+    ['power mean, decode phase', 'NVIDIA', r => { const p = (g(r).samples ?? []).filter(x => r.lodge?.first_content_ms != null && x.t_ms >= r.lodge.first_content_ms && x.power_draw_w != null).map(x => x.power_draw_w); return p.length ? p.reduce((x, y) => x + y, 0) / p.length : null; }, 'W'],
+    ['energy per generated token', 'derived', r => { const p = (g(r).samples ?? []).filter(x => r.lodge?.first_content_ms != null && x.t_ms >= r.lodge.first_content_ms && x.power_draw_w != null).map(x => x.power_draw_w); const t = tokps(o(r).eval_count, o(r).eval_duration); return p.length && t ? p.reduce((x, y) => x + y, 0) / p.length / t : null; }, 'J/tok'],
+    ['power max', 'NVIDIA', r => g(r).power_draw_w_max, 'W'],
+    ['SM clock max', 'NVIDIA', r => g(r).clocks_sm_mhz_max, 'MHz'],
+    ['memory clock max', 'NVIDIA', r => g(r).clocks_mem_mhz_max, 'MHz'],
+    ['temperature max', 'NVIDIA', r => g(r).temperature_c_max, '°C'],
+    ['P-states seen', 'NVIDIA', (m, runs) => [...new Set(runs.flatMap(r => g(r).pstates ?? []))].join(' '), 'text'],
+    ['clock-event reasons seen', 'NVIDIA', (m, runs) => [...new Set(runs.flatMap(r => g(r).clock_event_reasons ?? []))].join(' ') || 'none', 'text'],
+    ['group', 'Output'],
+    ['generated tokens', 'Ollama', r => o(r).eval_count, 'tok'],
+    ['done reasons', 'Ollama', (m, runs) => [...new Set(runs.map(r => o(r).done_reason))].join(' '), 'text'],
+    ['distinct response hashes', 'derived', (m, runs) => { const h = [...new Set(runs.map(r => r.sha256?.slice(0, 12)))]; return `${h.length} of ${runs.length} runs: ${h.join(', ')}`; }, 'text'],
+  ];
+}
+
+function quantCompare(s) {
+  const ms = [s.model, s.model_b];
+  const stored = Object.fromEntries(ms.map((m, i) => [m, s.stored?.[i] ?? null]));
+  const ctx = { ...s, stored };
+  const out = [];
+  for (const row of quantCompareRows(ctx)) {
+    if (row[0] === 'group') { out.push({ group: row[1] }); continue; }
+    const [label, kind, fn, unit, mode] = row;
+    const cells = ms.map(m => {
+      const runs = s.runs.filter(r => r.model === m);
+      if (unit === 'text') return { text: fn(m, runs) ?? '—' };
+      if (mode === 'static') { const v = fn(m); return { n: 1, min: v, median: v, max: v }; }
+      const v = runs.map(fn).filter(x => typeof x === 'number' && Number.isFinite(x));
+      if (!v.length) return { n: 0 };
+      return { n: v.length, min: Math.min(...v), median: median(v), max: Math.max(...v), spread_pct: median(v) ? (Math.max(...v) - Math.min(...v)) / median(v) * 100 : null };
+    });
+    const [A, B] = cells;
+    const delta = A.median != null && B.median != null ? { diff: B.median - A.median, ratio: A.median ? B.median / A.median : null } : null;
+    out.push({ label, kind, unit, a: A, b: B, delta });
+  }
+  return out;
+}
+
+function renderQuantCompare(s) {
+  const f = (x, unit) => x == null ? '—' : (unit === 'MiB' || unit === 'ms' || unit === 'MHz' || unit === 'tok' ? Math.round(x).toLocaleString() : x.toFixed(1));
+  const cell = (c, unit) => c.text != null ? esc(c.text) : !c.n ? '—' : c.min === c.max
+    ? `${f(c.median, unit)} ${esc(unit)} <span class="src">(n=${c.n}, all equal)</span>`
+    : `${f(c.median, unit)} ${esc(unit)} <span class="src">[${f(c.min, unit)} – ${f(c.max, unit)}] n=${c.n}, spread ${c.spread_pct?.toFixed(1)} %</span>`;
+  let html = `<h2 style="margin-top:14px">A | B <span class="src">— median [min – max] per model; deltas compare medians</span></h2><div style="overflow-x:auto"><table><tr><th></th><th>kind</th><th>A: ${esc(s.model)}</th><th>B: ${esc(s.model_b)}</th><th>B − A</th><th>B ÷ A</th></tr>`;
+  for (const r of quantCompare(s)) {
+    if (r.group) { html += `<tr class="sum first"><th colspan="6">${esc(r.group)}</th></tr>`; continue; }
+    html += `<tr><th>${esc(r.label)}</th><td><kbd class="k">${esc(r.kind)}</kbd></td><td class="v" style="text-align:left">${cell(r.a, r.unit)}</td><td class="v" style="text-align:left">${cell(r.b, r.unit)}</td>`
+      + `<td class="v">${r.delta ? (r.delta.diff >= 0 ? '+' : '') + f(r.delta.diff, r.unit) : ''}</td><td class="v muted">${r.delta?.ratio != null ? r.delta.ratio.toFixed(3) + '×' : ''}</td></tr>`;
+  }
+  return html + '</table></div>';
 }
 
 // The full series — settings, every run, every GPU sample, full response text.
 function seriesJson(s) {
   const { controller, ...rest } = s;
-  return JSON.stringify({ ...rest, summary: repeatSummary(s.runs).filter(Boolean) }, null, 2);
+  const summary = s.kind === 'Q'
+    ? Object.fromEntries([s.model, s.model_b].map(m => [m, repeatSummary(s.runs.filter(r => r.model === m)).filter(Boolean)]))
+    : repeatSummary(s.runs).filter(Boolean);
+  return JSON.stringify({ ...rest, summary, ...(s.kind === 'Q' ? { comparison: quantCompare(s) } : {}) }, null, 2);
 }
 
 $('runRep').onclick = () => {
   const model = $('repModel').value, prompt = $('repPrompt').value, n = Math.max(1, Math.min(50, Number($('repN').value) || 10));
   if (!model || !prompt.trim()) return;
-  runSeries($('repKind').value, model, prompt, n);
+  const kind = $('repKind').value, modelB = $('repModelB').value;
+  if (kind === 'Q' && (!modelB || modelB === model)) return;
+  runSeries(kind, model, prompt, n, kind === 'Q' ? modelB : null);
 };
 $('stopRep').onclick = () => { if (series) { series.stopped = true; series.controller.abort(); } };
 $('saveRep').onclick = () => {
   if (!series) return;
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([seriesJson(series)], { type:'application/json' }));
-  a.download = `lodge-m004-${series.kind}-${series.started_at.replace(/[:.]/g, '-')}.json`;
+  a.download = `lodge-m${series.mission}-${series.kind}-${series.started_at.replace(/[:.]/g, '-')}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 60000);
 };
